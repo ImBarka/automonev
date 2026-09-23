@@ -1,4 +1,8 @@
-# Pasang jadwal AutoMonev di Windows Task Scheduler.
+# Pasang jadwal AutoMonev di Windows Task Scheduler — CADANGAN untuk HP.
+# HP (Termux + MacroDroid) menjalankan pengingat dan kirim 22.30/23.15.
+# Laptop hanya mengirim jam 23.30 kalau HP gagal; bot selalu cek "sudah terisi?"
+# dulu, jadi tidak akan terkirim dobel.
+#
 # Jalankan sekali:  powershell -ExecutionPolicy Bypass -File pasang-jadwal.ps1
 # Hapus jadwal:     Unregister-ScheduledTask -TaskName "AutoMonev*" -Confirm:$false
 
@@ -6,12 +10,12 @@ $dir = $PSScriptRoot
 $pythonw = Join-Path (Split-Path (Get-Command python).Source) "pythonw.exe"
 $script = Join-Path $dir "automonev.py"
 
+# Bersihkan jadwal lama (versi sebelum HP dipakai)
+Get-ScheduledTask -TaskName "AutoMonev*" -ErrorAction SilentlyContinue |
+    Unregister-ScheduledTask -Confirm:$false
+
 $jadwal = @(
-    @{ Nama = "AutoMonev 1600 ingat"; Jam = "16:00"; Cmd = "ingat" },
-    @{ Nama = "AutoMonev 1900 ingat"; Jam = "19:00"; Cmd = "ingat" },
-    @{ Nama = "AutoMonev 2100 ingat"; Jam = "21:00"; Cmd = "ingat" },
-    @{ Nama = "AutoMonev 2230 kirim"; Jam = "22:30"; Cmd = "kirim" },
-    @{ Nama = "AutoMonev 2315 kirim"; Jam = "23:15"; Cmd = "kirim" }
+    @{ Nama = "AutoMonev 2330 kirim cadangan"; Jam = "23:30"; Cmd = "kirim" }
 )
 
 # StartWhenAvailable: kalau laptop mati/tidur saat jadwal, jalankan begitu nyala lagi.

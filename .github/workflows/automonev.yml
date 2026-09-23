@@ -28,7 +28,7 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python automonev.py jaga
+        run: pip install -q requests && python automonev.py jaga
       # GitHub mematikan jadwal kalau repo 60 hari tanpa aktivitas; ini menyalakannya lagi.
       - name: Keepalive
         if: always()

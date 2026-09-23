@@ -8,8 +8,8 @@ Perintah:
   python automonev.py jaga             (untuk GitHub) peringatkan kalau laptop belum
                                        melapor aman hari ini — tanpa login ke monev
 
-Login ke monev harus dari laptop/jaringan Indonesia: Cloudflare Kemnaker
-memblokir server GitHub.
+Login ke monev harus dari HP/laptop di jaringan rumahan/seluler: Cloudflare
+Kemnaker memblokir server pusat data seperti GitHub Actions.
 
 Balas bot Telegram dengan "/izin <alasan>" di hari itu supaya bot mengirim
 status "Tidak Hadir Dengan Keterangan", bukan "Hadir".
@@ -17,12 +17,13 @@ status "Tidak Hadir Dengan Keterangan", bukan "Hadir".
 import json
 import os
 import random
-import re
 import sys
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import requests
 
 HERE = Path(__file__).parent
 WIB = timezone(timedelta(hours=7))
@@ -122,58 +123,68 @@ def teks_laporan(tanggal):
 # ---------- Monev ----------
 
 class Monev:
-    def __init__(self, pw):
-        self.browser = pw.chromium.launch(headless=True)
-        self.ctx = self.browser.new_context(locale="id-ID", user_agent=UA)
+    """Klien monev lewat HTTP biasa (tanpa browser), jadi bisa jalan di Termux."""
+
+    SSO = "https://account.kemnaker.go.id"
+
+    def __init__(self):
+        self.s = requests.Session()
+        self.s.headers.update({"User-Agent": UA, "Accept": "application/json"})
         self.token = None
         self.user = None
 
+    def _cek_blokir(self, r):
+        if r.status_code in (403, 503) and "cloudflare" in r.text.lower():
+            raise RuntimeError("Diblokir Cloudflare Kemnaker (IP ini dianggap bot/pusat data).")
+
     def login(self):
-        page = self.ctx.new_page()
-        tokens = []
-
-        def on_resp(r):
-            if "/auth/" in r.url:
-                try:
-                    j = r.json()
-                    if isinstance(j, dict) and j.get("access_token"):
-                        tokens.append(j["access_token"])
-                except Exception:
-                    pass
-
-        page.on("response", on_resp)
+        app_hdr = {"Origin": APP, "Referer": APP + "/"}
+        # 1. API monev memberi URL login SSO (dan menyimpan cookie state)
+        r = self.s.get(API + "/auth/login", headers=app_hdr, timeout=30)
+        self._cek_blokir(r)
+        r.raise_for_status()
         try:
-            page.goto(f"{APP}/login", wait_until="load")
-            page.wait_for_url(re.compile("account.kemnaker.go.id"), timeout=60000)
-            page.locator("input[name=username]").fill(os.environ["MONEV_USER"], timeout=60000)
-            page.locator("input[type=password]").fill(os.environ["MONEV_PASS"])
-            page.locator("button[type=submit], button:has-text('Masuk')").first.click()
-            page.wait_for_url(re.compile(r"monev\.maganghub\.kemnaker\.go\.id/dashboard"), timeout=60000)
-            page.wait_for_timeout(3000)
-        except Exception as e:
-            page.screenshot(path=str(HERE / "login-gagal.png"), full_page=True)
-            try:
-                teks = " ".join(page.inner_text("body").split())[:300]
-            except Exception:
-                teks = "?"
-            raise RuntimeError(f"Login gagal di {page.url} | judul: {page.title()} | isi: {teks} | {type(e).__name__}")
-        if not tokens:
-            raise RuntimeError("Login berhasil tapi access token tidak tertangkap")
-        self.token = tokens[-1]
+            j = r.json()
+        except ValueError:
+            j = r.text.strip().strip('"')
+        sso_url = j if isinstance(j, str) else (j.get("redirectUrl") or j.get("redirect_uri") or j.get("url"))
+        # 2. Halaman login SiapKerja -> cookie XSRF-TOKEN
+        r = self.s.get(sso_url, headers={"Accept": "text/html"}, timeout=30)
+        self._cek_blokir(r)
+        xsrf = urllib.parse.unquote(self.s.cookies.get("XSRF-TOKEN", domain="account.kemnaker.go.id") or "")
+        # 3. Kirim username + password
+        r = self.s.post(f"{self.SSO}/auth/login", timeout=30,
+                        json={"username": os.environ["MONEV_USER"], "password": os.environ["MONEV_PASS"]},
+                        headers={"X-XSRF-TOKEN": xsrf, "X-Requested-With": "XMLHttpRequest",
+                                 "Origin": self.SSO, "Referer": r.url})
+        self._cek_blokir(r)
+        if not r.ok:
+            raise RuntimeError(f"Login SiapKerja ditolak ({r.status_code}): {r.text[:200]}")
+        redirect = r.json()["data"]["redirect_uri"]
+        # 4. Ikuti redirect sampai /sso/callback?code=...&state=...
+        r = self.s.get(redirect, headers={"Accept": "text/html"}, timeout=30)
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(r.url).query)
+        if "code" not in q:
+            raise RuntimeError(f"Login tidak kembali ke monev (berhenti di {r.url[:120]})")
+        # 5. Tukar code dengan access token
+        r = self.s.get(API + "/auth/login/callback", headers=app_hdr, timeout=30,
+                       params={"code": q["code"][0], "state": q["state"][0]})
+        r.raise_for_status()
+        self.token = r.json()["access_token"]
         self.user = self.get("/users/me")["data"]
 
     def _req(self, method, path, **kw):
-        r = self.ctx.request.fetch(API + path, method=method,
-                                   headers={"Authorization": f"Bearer {self.token}"}, **kw)
+        r = self.s.request(method, API + path, timeout=30, headers={
+            "Authorization": f"Bearer {self.token}", "Origin": APP, "Referer": APP + "/"}, **kw)
         if not r.ok:
-            raise RuntimeError(f"{method} {path} -> {r.status}: {r.text()[:300]}")
+            raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text[:300]}")
         return r.json()
 
     def get(self, path, params=None):
         return self._req("GET", path, params=params)
 
     def post(self, path, body):
-        return self._req("POST", path, data=body)
+        return self._req("POST", path, json=body)
 
     def sudah_isi(self, tanggal):
         d = tanggal.isoformat()
@@ -216,7 +227,7 @@ class Monev:
         return self.post("/attendances", body)
 
     def close(self):
-        self.browser.close()
+        self.s.close()
 
 
 # ---------- Perintah ----------
@@ -234,9 +245,9 @@ def main():
             print("Aman.")
             return
         jam = datetime.now(WIB).strftime("%H:%M")
-        notify(f"⚠️ <b>Laptop belum melapor monev {tgl} aman</b> (sekarang {jam} WIB).\n"
-               f"Mungkin laptop mati/offline, jadi bot tidak bisa cek atau kirim otomatis.\n"
-               f"Nyalakan laptop, atau isi manual di HP sebelum 23.59: {APP}")
+        notify(f"⚠️ <b>Bot belum melapor monev {tgl} aman</b> (sekarang {jam} WIB).\n"
+               f"Mungkin HP/laptop mati atau offline, jadi bot tidak bisa cek atau kirim otomatis.\n"
+               f"Isi manual di HP sebelum 23.59: {APP}")
         return
 
     # Task Scheduler menjalankan jadwal yang terlewat begitu laptop nyala; jangan sampai
@@ -246,72 +257,70 @@ def main():
         print(f"'{cmd}' hanya jalan setelah jam {jam_min}.00 WIB (tambahkan --paksa untuk tes).")
         return
 
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as pw:
-        m = Monev(pw)
-        try:
-            m.login()
-            if m.sudah_isi(tanggal):
-                print(f"Laporan {tgl} sudah masuk.")
-                tandai_aman(tanggal, "terisi")
+    m = Monev()
+    try:
+        m.login()
+        if m.sudah_isi(tanggal):
+            print(f"Laporan {tgl} sudah masuk.")
+            tandai_aman(tanggal, "terisi")
+            return
+        libur = m.alasan_libur(tanggal)
+        if libur:
+            print(f"{tgl}: {libur}, tidak perlu isi.")
+            tandai_aman(tanggal, "libur")
+            return
+
+        if cmd == "cek":
+            print(f"Laporan {tgl} BELUM diisi.")
+
+        elif cmd == "ingat":
+            isi = teks_laporan(tanggal)
+            jam = datetime.now(WIB).strftime("%H:%M")
+            notify(
+                f"⏰ <b>Monev {tgl} belum diisi</b> (sekarang {jam} WIB, batas 23.59)\n"
+                f"Isi di HP: {APP}\n\n"
+                f"<b>Uraian aktivitas</b>\n<code>{isi['activity_log']}</code>\n\n"
+                f"<b>Pembelajaran</b>\n<code>{isi['lesson_learned']}</code>\n\n"
+                f"<b>Kendala</b>\n<code>{isi['obstacles']}</code>\n\n"
+                f"Kalau tidak diisi, bot akan kirim otomatis jam ~22.30 tanpa lokasi.\n"
+                f"Tidak masuk hari ini? Balas: /izin alasannya"
+            )
+
+        elif cmd == "kirim":
+            if os.environ.get("AUTO_SUBMIT", "1") != "1":
+                notify(f"🚨 Monev {tgl} BELUM diisi dan kirim otomatis dimatikan. Isi sekarang: {APP}")
                 return
-            libur = m.alasan_libur(tanggal)
-            if libur:
-                print(f"{tgl}: {libur}, tidak perlu isi.")
-                tandai_aman(tanggal, "libur")
-                return
-
-            if cmd == "cek":
-                print(f"Laporan {tgl} BELUM diisi.")
-
-            elif cmd == "ingat":
-                isi = teks_laporan(tanggal)
-                jam = datetime.now(WIB).strftime("%H:%M")
-                notify(
-                    f"⏰ <b>Monev {tgl} belum diisi</b> (sekarang {jam} WIB, batas 23.59)\n"
-                    f"Isi di HP: {APP}\n\n"
-                    f"<b>Uraian aktivitas</b>\n<code>{isi['activity_log']}</code>\n\n"
-                    f"<b>Pembelajaran</b>\n<code>{isi['lesson_learned']}</code>\n\n"
-                    f"<b>Kendala</b>\n<code>{isi['obstacles']}</code>\n\n"
-                    f"Kalau tidak diisi, bot akan kirim otomatis jam ~22.30 tanpa lokasi.\n"
-                    f"Tidak masuk hari ini? Balas: /izin alasannya"
-                )
-
-            elif cmd == "kirim":
-                if os.environ.get("AUTO_SUBMIT", "1") != "1":
-                    notify(f"🚨 Monev {tgl} BELUM diisi dan kirim otomatis dimatikan. Isi sekarang: {APP}")
-                    return
-                alasan = izin_hari_ini()
-                if alasan:
-                    if dry:
-                        print("[dry-run] akan kirim IZIN:", alasan)
-                        return
-                    m.kirim_izin(tanggal, alasan)
-                    ok = m.sudah_isi(tanggal)
-                    if ok:
-                        tandai_aman(tanggal, "izin")
-                    notify(f"{'✅' if ok else '❓'} Monev {tgl} dikirim otomatis: Tidak Hadir Dengan Keterangan — {alasan}")
-                    return
-                isi = teks_laporan(tanggal)
+            alasan = izin_hari_ini()
+            if alasan:
                 if dry:
-                    print("[dry-run] akan kirim HADIR:")
-                    for k, v in isi.items():
-                        print(f"  {k} ({len(v)} kar): {v}")
+                    print("[dry-run] akan kirim IZIN:", alasan)
                     return
-                m.kirim_hadir(tanggal, isi)
+                m.kirim_izin(tanggal, alasan)
                 ok = m.sudah_isi(tanggal)
                 if ok:
-                    tandai_aman(tanggal, "otomatis")
-                    notify(f"✅ Monev {tgl} dikirim otomatis (Hadir, tanpa lokasi).")
-                else:
-                    notify(f"❓ Monev {tgl} sudah dikirim tapi belum terlihat di sistem. Cek manual: {APP}")
+                    tandai_aman(tanggal, "izin")
+                notify(f"{'✅' if ok else '❓'} Monev {tgl} dikirim otomatis: Tidak Hadir Dengan Keterangan — {alasan}")
+                return
+            isi = teks_laporan(tanggal)
+            if dry:
+                print("[dry-run] akan kirim HADIR:")
+                for k, v in isi.items():
+                    print(f"  {k} ({len(v)} kar): {v}")
+                return
+            m.kirim_hadir(tanggal, isi)
+            ok = m.sudah_isi(tanggal)
+            if ok:
+                tandai_aman(tanggal, "otomatis")
+                notify(f"✅ Monev {tgl} dikirim otomatis (Hadir, tanpa lokasi).")
             else:
-                print(__doc__)
-        except Exception as e:
-            notify(f"❌ AutoMonev error ({cmd}) {tgl}: {e}\nIsi manual sekarang: {APP}")
-            raise
-        finally:
-            m.close()
+                notify(f"❓ Monev {tgl} sudah dikirim tapi belum terlihat di sistem. Cek manual: {APP}")
+        else:
+            print(__doc__)
+    except Exception as e:
+        notify(f"❌ AutoMonev error ({cmd}) {tgl}: {e}\nIsi manual sekarang: {APP}")
+        raise
+    finally:
+        m.close()
 
 
 if __name__ == "__main__":
