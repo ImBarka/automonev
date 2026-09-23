@@ -5,6 +5,11 @@ Perintah:
   python automonev.py ingat            kirim pengingat Telegram kalau belum diisi
   python automonev.py kirim            kirim otomatis (tanpa GPS) kalau belum diisi
   python automonev.py kirim --dry-run  tampilkan isian tanpa mengirim
+  python automonev.py jaga             (untuk GitHub) peringatkan kalau laptop belum
+                                       melapor aman hari ini — tanpa login ke monev
+
+Login ke monev harus dari laptop/jaringan Indonesia: Cloudflare Kemnaker
+memblokir server GitHub.
 
 Balas bot Telegram dengan "/izin <alasan>" di hari itu supaya bot mengirim
 status "Tidak Hadir Dengan Keterangan", bukan "Hadir".
@@ -18,8 +23,6 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-from playwright.sync_api import sync_playwright
 
 HERE = Path(__file__).parent
 WIB = timezone(timedelta(hours=7))
@@ -85,6 +88,20 @@ def izin_hari_ini():
         elif text.lower().startswith("/batal"):
             alasan = None
     return alasan
+
+
+def tandai_aman(tanggal, ket):
+    """Catat di deskripsi bot bahwa hari ini sudah aman, supaya penjaga di GitHub tahu."""
+    try:
+        tg("setMyShortDescription", short_description=f"monev-aman:{tanggal.isoformat()}:{ket}"[:120])
+    except Exception as e:
+        print("Gagal menandai aman:", e)
+
+
+def sudah_aman(tanggal):
+    res = tg("getMyShortDescription") or {}
+    desc = (res.get("result") or {}).get("short_description", "")
+    return desc.startswith(f"monev-aman:{tanggal.isoformat()}")
 
 
 # ---------- Teks laporan ----------
@@ -212,16 +229,36 @@ def main():
     tanggal = today()
     tgl = tanggal.strftime("%d-%m-%Y")
 
+    if cmd == "jaga":
+        if tanggal.strftime("%A").upper() == "SUNDAY" or sudah_aman(tanggal):
+            print("Aman.")
+            return
+        jam = datetime.now(WIB).strftime("%H:%M")
+        notify(f"⚠️ <b>Laptop belum melapor monev {tgl} aman</b> (sekarang {jam} WIB).\n"
+               f"Mungkin laptop mati/offline, jadi bot tidak bisa cek atau kirim otomatis.\n"
+               f"Nyalakan laptop, atau isi manual di HP sebelum 23.59: {APP}")
+        return
+
+    # Task Scheduler menjalankan jadwal yang terlewat begitu laptop nyala; jangan sampai
+    # "kirim" 22.30 yang terlewat malah mengirim laporan hari berikutnya jam 7 pagi.
+    jam_min = {"ingat": 15, "kirim": 22}.get(cmd)
+    if jam_min and datetime.now(WIB).hour < jam_min and "--paksa" not in args:
+        print(f"'{cmd}' hanya jalan setelah jam {jam_min}.00 WIB (tambahkan --paksa untuk tes).")
+        return
+
+    from playwright.sync_api import sync_playwright
     with sync_playwright() as pw:
         m = Monev(pw)
         try:
             m.login()
             if m.sudah_isi(tanggal):
                 print(f"Laporan {tgl} sudah masuk.")
+                tandai_aman(tanggal, "terisi")
                 return
             libur = m.alasan_libur(tanggal)
             if libur:
                 print(f"{tgl}: {libur}, tidak perlu isi.")
+                tandai_aman(tanggal, "libur")
                 return
 
             if cmd == "cek":
@@ -251,6 +288,8 @@ def main():
                         return
                     m.kirim_izin(tanggal, alasan)
                     ok = m.sudah_isi(tanggal)
+                    if ok:
+                        tandai_aman(tanggal, "izin")
                     notify(f"{'✅' if ok else '❓'} Monev {tgl} dikirim otomatis: Tidak Hadir Dengan Keterangan — {alasan}")
                     return
                 isi = teks_laporan(tanggal)
@@ -262,6 +301,7 @@ def main():
                 m.kirim_hadir(tanggal, isi)
                 ok = m.sudah_isi(tanggal)
                 if ok:
+                    tandai_aman(tanggal, "otomatis")
                     notify(f"✅ Monev {tgl} dikirim otomatis (Hadir, tanpa lokasi).")
                 else:
                     notify(f"❓ Monev {tgl} sudah dikirim tapi belum terlihat di sistem. Cek manual: {APP}")
@@ -275,4 +315,9 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.stdout is None:  # dijalankan lewat pythonw (Task Scheduler): tulis log ke file
+        sys.stdout = sys.stderr = open(HERE / "automonev.log", "a", encoding="utf-8", buffering=1)
+        print(f"--- {datetime.now(WIB):%Y-%m-%d %H:%M} {' '.join(sys.argv[1:])}")
+    else:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     main()

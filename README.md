@@ -9,26 +9,34 @@ Pengingat + kirim otomatis laporan harian monev.maganghub.kemnaker.go.id.
 
 Bot **tidak pernah memalsukan lokasi**. Laporan kiriman bot tercatat tanpa koordinat.
 
-## Jalankan lokal
+## Di mana bot berjalan
+
+**Laptop (utama).** Cloudflare Kemnaker memblokir server GitHub, jadi login monev harus dari laptop.
+Jadwal dipasang di Windows Task Scheduler oleh `pasang-jadwal.ps1`:
+
+| Jam WIB | Perintah |
+|---|---|
+| 16.00, 19.00, 21.00 | `ingat` |
+| 22.30, 23.15 | `kirim` |
+
+- Jadwal yang terlewat (laptop mati/tidur) dijalankan begitu laptop nyala, tapi `kirim` hanya mau jalan di atas jam 22.00 dan `ingat` di atas jam 15.00.
+- Malam hari, **Sleep** laptop saja, jangan Shut down: Task Scheduler bisa membangunkan laptop dari Sleep.
+- Log: `automonev.log`.
+
+**GitHub Actions (penjaga).** Jam 21.30 dan 23.15 WIB, GitHub mengecek apakah laptop sudah melapor "aman" hari ini
+(ditandai lewat deskripsi bot Telegram). Kalau belum, misalnya karena laptop mati, kamu dapat peringatan untuk isi manual di HP.
+Secrets: `TG_TOKEN`, `TG_CHAT_ID` (`MONEV_USER`/`MONEV_PASS` tidak dipakai di sana).
+
+## Jalankan manual
 
 ```
 pip install playwright && python -m playwright install chromium
 python automonev.py cek
-python automonev.py kirim --dry-run
+python automonev.py kirim --dry-run --paksa
+powershell -ExecutionPolicy Bypass -File pasang-jadwal.ps1
 ```
 
 Kredensial dibaca dari `.env` (lihat `.env.example`). `.env` tidak boleh di-commit.
-
-## Pasang di GitHub Actions (jalan walau laptop mati)
-
-1. Buat repo **private** baru, push isi folder ini (`.env` dan `kredential.md` sudah di-ignore).
-2. Settings → Secrets and variables → Actions → tambahkan `MONEV_USER`, `MONEV_PASS`, `TG_TOKEN`, `TG_CHAT_ID`.
-3. Tab Actions → automonev → Run workflow → `cek` untuk tes.
-
-## Telegram
-
-1. Chat @BotFather → `/newbot` → salin token ke `TG_TOKEN`.
-2. Kirim pesan apa saja ke bot kamu, lalu buka `https://api.telegram.org/bot<TOKEN>/getUpdates` → ambil `chat.id` → `TG_CHAT_ID`.
 
 ## Ubah teks
 
