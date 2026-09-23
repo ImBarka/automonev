@@ -125,17 +125,21 @@ class Monev:
                     pass
 
         page.on("response", on_resp)
-        page.goto(f"{APP}/login", wait_until="load")
-        page.wait_for_url(re.compile("account.kemnaker.go.id"), timeout=60000)
-        page.locator("input[name=username]").fill(os.environ["MONEV_USER"])
-        page.locator("input[type=password]").fill(os.environ["MONEV_PASS"])
-        page.locator("button[type=submit], button:has-text('Masuk')").first.click()
         try:
+            page.goto(f"{APP}/login", wait_until="load")
+            page.wait_for_url(re.compile("account.kemnaker.go.id"), timeout=60000)
+            page.locator("input[name=username]").fill(os.environ["MONEV_USER"], timeout=60000)
+            page.locator("input[type=password]").fill(os.environ["MONEV_PASS"])
+            page.locator("button[type=submit], button:has-text('Masuk')").first.click()
             page.wait_for_url(re.compile(r"monev\.maganghub\.kemnaker\.go\.id/dashboard"), timeout=60000)
             page.wait_for_timeout(3000)
-        except Exception:
-            page.screenshot(path=str(HERE / "login-gagal.png"))
-            raise RuntimeError(f"Login gagal, berhenti di {page.url} (lihat login-gagal.png)")
+        except Exception as e:
+            page.screenshot(path=str(HERE / "login-gagal.png"), full_page=True)
+            try:
+                teks = " ".join(page.inner_text("body").split())[:300]
+            except Exception:
+                teks = "?"
+            raise RuntimeError(f"Login gagal di {page.url} | judul: {page.title()} | isi: {teks} | {type(e).__name__}")
         if not tokens:
             raise RuntimeError("Login berhasil tapi access token tidak tertangkap")
         self.token = tokens[-1]
