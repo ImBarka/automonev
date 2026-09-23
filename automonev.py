@@ -1,0 +1,274 @@
+"""AutoMonev — pengingat + kirim otomatis laporan harian monev.maganghub.kemnaker.go.id.
+
+Perintah:
+  python automonev.py cek              cek apakah laporan hari ini sudah masuk
+  python automonev.py ingat            kirim pengingat Telegram kalau belum diisi
+  python automonev.py kirim            kirim otomatis (tanpa GPS) kalau belum diisi
+  python automonev.py kirim --dry-run  tampilkan isian tanpa mengirim
+
+Balas bot Telegram dengan "/izin <alasan>" di hari itu supaya bot mengirim
+status "Tidak Hadir Dengan Keterangan", bukan "Hadir".
+"""
+import json
+import os
+import random
+import re
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+HERE = Path(__file__).parent
+WIB = timezone(timedelta(hours=7))
+APP = "https://monev.maganghub.kemnaker.go.id"
+API = "https://monev-api.maganghub.kemnaker.go.id/api/v1"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/140.0 Safari/537.36")
+MIN_CHARS = 100
+
+
+def load_env():
+    env_file = HERE / ".env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+
+def today():
+    return datetime.now(WIB).date()
+
+
+# ---------- Telegram ----------
+
+def tg(method, **params):
+    token = os.environ.get("TG_TOKEN")
+    if not token:
+        return None
+    data = urllib.parse.urlencode(params).encode()
+    with urllib.request.urlopen(f"https://api.telegram.org/bot{token}/{method}", data, timeout=20) as r:
+        return json.load(r)
+
+
+def notify(text):
+    print(text)
+    if os.environ.get("TG_TOKEN") and os.environ.get("TG_CHAT_ID"):
+        try:
+            tg("sendMessage", chat_id=os.environ["TG_CHAT_ID"], text=text, parse_mode="HTML")
+        except Exception as e:
+            print("Gagal kirim Telegram:", e)
+
+
+def izin_hari_ini():
+    """Cari pesan '/izin <alasan>' dari kamu hari ini. Return alasan atau None."""
+    if not (os.environ.get("TG_TOKEN") and os.environ.get("TG_CHAT_ID")):
+        return None
+    try:
+        res = tg("getUpdates", limit=100) or {}
+    except Exception as e:
+        print("Gagal baca Telegram:", e)
+        return None
+    alasan = None
+    for u in res.get("result", []):
+        m = u.get("message") or {}
+        if str(m.get("chat", {}).get("id")) != os.environ["TG_CHAT_ID"]:
+            continue
+        if datetime.fromtimestamp(m.get("date", 0), WIB).date() != today():
+            continue
+        text = (m.get("text") or "").strip()
+        if text.lower().startswith("/izin"):
+            alasan = text[5:].strip() or "Izin tidak masuk magang hari ini."
+        elif text.lower().startswith("/batal"):
+            alasan = None
+    return alasan
+
+
+# ---------- Teks laporan ----------
+
+def teks_laporan(tanggal):
+    """Pilih variasi teks dari teks.json, konsisten per tanggal, minimal 100 karakter."""
+    pools = json.loads((HERE / "teks.json").read_text(encoding="utf-8"))
+    rng = random.Random(tanggal.isoformat())
+    out = {}
+    for field in ("activity_log", "lesson_learned", "obstacles"):
+        pilihan = [t for t in pools[field] if len(t) >= MIN_CHARS]
+        if not pilihan:
+            raise SystemExit(f"teks.json: tidak ada teks '{field}' yang >= {MIN_CHARS} karakter")
+        out[field] = rng.choice(pilihan)
+    return out
+
+
+# ---------- Monev ----------
+
+class Monev:
+    def __init__(self, pw):
+        self.browser = pw.chromium.launch(headless=True)
+        self.ctx = self.browser.new_context(locale="id-ID", user_agent=UA)
+        self.token = None
+        self.user = None
+
+    def login(self):
+        page = self.ctx.new_page()
+        tokens = []
+
+        def on_resp(r):
+            if "/auth/" in r.url:
+                try:
+                    j = r.json()
+                    if isinstance(j, dict) and j.get("access_token"):
+                        tokens.append(j["access_token"])
+                except Exception:
+                    pass
+
+        page.on("response", on_resp)
+        page.goto(f"{APP}/login", wait_until="load")
+        page.wait_for_url(re.compile("account.kemnaker.go.id"), timeout=60000)
+        page.locator("input[name=username]").fill(os.environ["MONEV_USER"])
+        page.locator("input[type=password]").fill(os.environ["MONEV_PASS"])
+        page.locator("button[type=submit], button:has-text('Masuk')").first.click()
+        try:
+            page.wait_for_url(re.compile(r"monev\.maganghub\.kemnaker\.go\.id/dashboard"), timeout=60000)
+            page.wait_for_timeout(3000)
+        except Exception:
+            page.screenshot(path=str(HERE / "login-gagal.png"))
+            raise RuntimeError(f"Login gagal, berhenti di {page.url} (lihat login-gagal.png)")
+        if not tokens:
+            raise RuntimeError("Login berhasil tapi access token tidak tertangkap")
+        self.token = tokens[-1]
+        self.user = self.get("/users/me")["data"]
+
+    def _req(self, method, path, **kw):
+        r = self.ctx.request.fetch(API + path, method=method,
+                                   headers={"Authorization": f"Bearer {self.token}"}, **kw)
+        if not r.ok:
+            raise RuntimeError(f"{method} {path} -> {r.status}: {r.text()[:300]}")
+        return r.json()
+
+    def get(self, path, params=None):
+        return self._req("GET", path, params=params)
+
+    def post(self, path, body):
+        return self._req("POST", path, data=body)
+
+    def sudah_isi(self, tanggal):
+        d = tanggal.isoformat()
+        res = self.get("/attendances", {"participant_id": self.user["id"], "start_date": d, "end_date": d})
+        return any(a.get("date") == d for a in res.get("data", []))
+
+    def alasan_libur(self, tanggal):
+        """Return nama libur / 'hari off' kalau tanggal ini bukan hari magang, else None."""
+        u = self.user
+        if tanggal.strftime("%A").upper() in (u.get("off_days") or []):
+            return f"hari off ({tanggal.strftime('%A')})"
+        start = datetime.fromisoformat(u["internship_start_date"]).date()
+        end = datetime.fromisoformat(u["internship_end_date"]).date()
+        if not (start <= tanggal <= end):
+            return "di luar periode magang"
+        clean = lambda s: str(s or "").replace(".", "").strip()
+        prov, kab = clean(u.get("internship_location_province_code")), clean(u.get("internship_location_regency_code"))
+        page = 1
+        while True:
+            res = self.get("/holidays", {"page": page, "limit": 100})
+            for h in res.get("data", []):
+                if not str(h.get("date", "")).startswith(tanggal.isoformat()):
+                    continue
+                scope = h.get("scope")
+                if (scope == "NATIONAL"
+                        or (scope == "PROVINCE" and clean(h.get("province_code")) == prov)
+                        or (scope not in ("NATIONAL", "PROVINCE") and clean(h.get("regency_code")) == kab)):
+                    return h.get("name") or h.get("description") or "hari libur"
+            if page * 100 >= res.get("total", 0):
+                return None
+            page += 1
+
+    def kirim_hadir(self, tanggal, isi):
+        body = {"date": tanggal.isoformat(), "status": "PRESENT", **isi}
+        return self.post("/attendances/with-daily-log", body)
+
+    def kirim_izin(self, tanggal, alasan):
+        body = {"date": tanggal.isoformat(), "status": "ON_LEAVE", "leave_reason": alasan,
+                "participant_id": self.user["id"]}
+        return self.post("/attendances", body)
+
+    def close(self):
+        self.browser.close()
+
+
+# ---------- Perintah ----------
+
+def main():
+    load_env()
+    args = sys.argv[1:]
+    cmd = args[0] if args else "cek"
+    dry = "--dry-run" in args
+    tanggal = today()
+    tgl = tanggal.strftime("%d-%m-%Y")
+
+    with sync_playwright() as pw:
+        m = Monev(pw)
+        try:
+            m.login()
+            if m.sudah_isi(tanggal):
+                print(f"Laporan {tgl} sudah masuk.")
+                return
+            libur = m.alasan_libur(tanggal)
+            if libur:
+                print(f"{tgl}: {libur}, tidak perlu isi.")
+                return
+
+            if cmd == "cek":
+                print(f"Laporan {tgl} BELUM diisi.")
+
+            elif cmd == "ingat":
+                isi = teks_laporan(tanggal)
+                jam = datetime.now(WIB).strftime("%H:%M")
+                notify(
+                    f"⏰ <b>Monev {tgl} belum diisi</b> (sekarang {jam} WIB, batas 23.59)\n"
+                    f"Isi di HP: {APP}\n\n"
+                    f"<b>Uraian aktivitas</b>\n<code>{isi['activity_log']}</code>\n\n"
+                    f"<b>Pembelajaran</b>\n<code>{isi['lesson_learned']}</code>\n\n"
+                    f"<b>Kendala</b>\n<code>{isi['obstacles']}</code>\n\n"
+                    f"Kalau tidak diisi, bot akan kirim otomatis jam ~22.30 tanpa lokasi.\n"
+                    f"Tidak masuk hari ini? Balas: /izin alasannya"
+                )
+
+            elif cmd == "kirim":
+                if os.environ.get("AUTO_SUBMIT", "1") != "1":
+                    notify(f"🚨 Monev {tgl} BELUM diisi dan kirim otomatis dimatikan. Isi sekarang: {APP}")
+                    return
+                alasan = izin_hari_ini()
+                if alasan:
+                    if dry:
+                        print("[dry-run] akan kirim IZIN:", alasan)
+                        return
+                    m.kirim_izin(tanggal, alasan)
+                    ok = m.sudah_isi(tanggal)
+                    notify(f"{'✅' if ok else '❓'} Monev {tgl} dikirim otomatis: Tidak Hadir Dengan Keterangan — {alasan}")
+                    return
+                isi = teks_laporan(tanggal)
+                if dry:
+                    print("[dry-run] akan kirim HADIR:")
+                    for k, v in isi.items():
+                        print(f"  {k} ({len(v)} kar): {v}")
+                    return
+                m.kirim_hadir(tanggal, isi)
+                ok = m.sudah_isi(tanggal)
+                if ok:
+                    notify(f"✅ Monev {tgl} dikirim otomatis (Hadir, tanpa lokasi).")
+                else:
+                    notify(f"❓ Monev {tgl} sudah dikirim tapi belum terlihat di sistem. Cek manual: {APP}")
+            else:
+                print(__doc__)
+        except Exception as e:
+            notify(f"❌ AutoMonev error ({cmd}) {tgl}: {e}\nIsi manual sekarang: {APP}")
+            raise
+        finally:
+            m.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,56 @@
+name: automonev
+
+on:
+  schedule:
+    # GitHub cron pakai UTC (WIB = UTC+7). Jadwal bisa telat 5–30 menit.
+    - cron: "0 9 * * *"    # 16.00 WIB  pengingat
+    - cron: "0 12 * * *"   # 19.00 WIB  pengingat
+    - cron: "0 14 * * *"   # 21.00 WIB  pengingat
+    - cron: "30 15 * * *"  # 22.30 WIB  kirim otomatis
+    - cron: "15 16 * * *"  # 23.15 WIB  kirim otomatis (cadangan kalau yang 22.30 gagal/telat)
+  workflow_dispatch:
+    inputs:
+      cmd:
+        description: "cek / ingat / kirim"
+        default: "cek"
+
+permissions:
+  contents: read
+  actions: write   # untuk keepalive di bawah
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install playwright && python -m playwright install --with-deps chromium
+      - name: Jalankan
+        env:
+          MONEV_USER: ${{ secrets.MONEV_USER }}
+          MONEV_PASS: ${{ secrets.MONEV_PASS }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          AUTO_SUBMIT: "1"
+          INPUT_CMD: ${{ github.event.inputs.cmd }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          if [ -n "$INPUT_CMD" ]; then CMD="$INPUT_CMD"
+          elif [ "$SCHEDULE" = "30 15 * * *" ] || [ "$SCHEDULE" = "15 16 * * *" ]; then CMD=kirim
+          else CMD=ingat; fi
+          python automonev.py "$CMD"
+      # GitHub mematikan jadwal kalau repo 60 hari tanpa aktivitas; ini menyalakannya lagi.
+      - name: Keepalive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/automonev.yml/enable" || true
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: login-gagal
+          path: login-gagal.png
+          if-no-files-found: ignore
